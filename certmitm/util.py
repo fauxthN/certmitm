@@ -82,6 +82,8 @@ def create_client_context():
     upstream_context.check_hostname = False
     upstream_context.verify_mode = ssl.CERT_NONE
     upstream_context.verify = False
+    if hasattr(upstream_context, "set_alpn_protocols"):
+        upstream_context.set_alpn_protocols(["h2", "http/1.1"])
     return upstream_context
 
 def create_server_context():
