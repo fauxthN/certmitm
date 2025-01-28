@@ -107,23 +107,24 @@ class connection(object):
             host, port = parse_connect_line(peek_data)
             if host is not None:
                 self.logger.debug(f"Parsed CONNECT host={host}, port={port}")
-                # Actually consume the data we peeked + read any leftover headers
-                initial_chunk = consume_bytes(self.client_socket, 4096)  # read what we peeked
-                # possibly we didn't read all the headers, so consume until blank line
-                leftover = consume_headers_until_blank_line(self.client_socket)
+                # Actually consume only as many bytes as we peeked
+                consumed = client_socket.recv(len(peek_data))  # remove them from the buffer
 
-                # send the HTTP 200 Connection Established
+                # We won't try to read leftover headers to avoid the timeout.
+                # Some clients may not send more data or a blank line.
+
+                # Send the HTTP 200 Connection Established
                 resp = b"HTTP/1.1 200 Connection Established\r\n\r\n"
                 self.client_socket.sendall(resp)
 
-                # set upstream info
+                # Now future data from the client should be a TLS handshake.
                 self.upstream_sni = host
-                self.upstream_ip = "127.0.0.1"
                 try:
                     resolved_ip = socket.gethostbyname(host)
                     self.upstream_ip = resolved_ip
                 except socket.gaierror:
                     self.logger.error(f"Could not resolve {host}, defaulting to 127.0.0.1")
+                    self.upstream_ip = "127.0.0.1"
                 self.upstream_port = port
             else:
                 # We failed to parse properly; fallback or close
