@@ -14,6 +14,69 @@ def counter():
 
 connection_counter = counter()
 
+def read_peek(client_socket, length=4096):
+    """
+    Peek at up to 'length' bytes from the socket without consuming them.
+    """
+    return client_socket.recv(length, socket.MSG_PEEK)
+
+def consume_bytes(client_socket, length):
+    """
+    Actually consume 'length' bytes from the socket.
+    """
+    return client_socket.recv(length)
+
+def parse_connect_line(data):
+    """
+    Given the initial data for a CONNECT request, parse out 'CONNECT host:port HTTP/...'
+    Returns (host, port) or (None, None) on failure.
+    """
+    lines = data.split(b'\r\n')
+    if len(lines) < 1:
+        return None, None
+
+    # first line e.g. b'CONNECT www.google.com:443 HTTP/1.1'
+    first_line = lines[0].strip()
+    if not first_line.startswith(b'CONNECT '):
+        return None, None
+
+    # remove 'CONNECT '
+    remainder = first_line[8:]
+    # remainder now e.g. b'www.google.com:443 HTTP/1.1'
+    parts = remainder.split(b' ')
+    if len(parts) < 2:
+        return None, None
+
+    host_port = parts[0]  # b'www.google.com:443'
+    if b':' in host_port:
+        host_str = host_port.decode('ascii')
+        host, port_str = host_str.split(':', 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            port = 443
+    else:
+        host = host_port.decode('ascii')
+        port = 443
+
+    return host, port
+
+def consume_headers_until_blank_line(client_socket):
+    """
+    Consumes data from the socket until we find a blank line (\r\n\r\n).
+    """
+    buffer = b''
+    while True:
+        chunk = client_socket.recv(1024)
+        if not chunk:
+            # client closed
+            break
+        buffer += chunk
+        # Look for a double CRLF that marks end of HTTP headers
+        if b'\r\n\r\n' in buffer:
+            break
+    return buffer
+
 class connection(object):
 
     def __init__(self, client_socket, logger):
@@ -24,56 +87,82 @@ class connection(object):
         self.client_socket = client_socket
         self.client_name = str(client_socket.getpeername())
         self.client_ip = self.client_name.split("'")[1]
-        self.client_port = int(self.client_name.split(" ")[1].split(')')[0]) #Dirty I know :)
-        # -- fauxthN: attempting to rewrite the below to work over https and use SNI matching --
-        # self.upstream_ip, self.upstream_port = certmitm.util.sock_to_dest(self.client_socket)
-        # if self.upstream_ip == "127.0.0.1" and self.upstream_port == 9900:
-        #     self.logger.debug(f"Setting debug upstream")
-        #     self.upstream_port = 10000
-        # try:
-        #     self.upstream_sni = certmitm.util.SNIFromHello(self.client_socket.recv(4096, socket.MSG_PEEK))
-        # except (TimeoutError, ConnectionResetError):
-        #     self.upstream_sni = None
-        # if self.upstream_sni:
-        #     self.upstream_name = self.upstream_sni
-        # else:
-        #     self.upstream_name = self.upstream_ip
-        # self.upstream_str = f"{self.upstream_ip}:{self.upstream_port}:{self.upstream_sni}"
+        self.client_port = int(self.client_name.split(" ")[1].split(')')[0]) # Dirty I know :)
 
-        # 1. Try reading ClientHello to get SNI
-        self.logger.debug("Reading TLS ClientHello to get SNI...")
+        # We will either parse a CONNECT request or do SNI-based resolution
+        self.upstream_sni = None
+        self.upstream_ip = "127.0.0.1"
+        self.upstream_port = 443
+
+        # First, peek at the initial data
+        peek_data = b''
         try:
-            peeked_data = self.client_socket.recv(4096, socket.MSG_PEEK)
-            self.upstream_sni = certmitm.util.SNIFromHello(peeked_data)
+            peek_data = read_peek(self.client_socket, 4096)
         except (TimeoutError, ConnectionResetError) as e:
-            self.logger.debug(f"Error while peeking TLS hello: {e}")
-            self.upstream_sni = None
+            self.logger.debug(f"Error peeking initial data: {e}")
 
-        # 2. If SNI found, do DNS lookup to get upstream IP
-        if self.upstream_sni:
-            self.logger.debug(f"SNI found: {self.upstream_sni}, resolving DNS...")
+        # Check if it's an HTTP CONNECT line
+        if peek_data.startswith(b'CONNECT '):
+            self.logger.debug("Detected HTTP CONNECT request.")
+            host, port = parse_connect_line(peek_data)
+            if host is not None:
+                self.logger.debug(f"Parsed CONNECT host={host}, port={port}")
+                # Actually consume the data we peeked + read any leftover headers
+                initial_chunk = consume_bytes(self.client_socket, 4096)  # read what we peeked
+                # possibly we didn't read all the headers, so consume until blank line
+                leftover = consume_headers_until_blank_line(self.client_socket)
+
+                # send the HTTP 200 Connection Established
+                resp = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+                self.client_socket.sendall(resp)
+
+                # set upstream info
+                self.upstream_sni = host
+                self.upstream_ip = "127.0.0.1"
+                try:
+                    resolved_ip = socket.gethostbyname(host)
+                    self.upstream_ip = resolved_ip
+                except socket.gaierror:
+                    self.logger.error(f"Could not resolve {host}, defaulting to 127.0.0.1")
+                self.upstream_port = port
+            else:
+                # We failed to parse properly; fallback or close
+                self.logger.error("Could not parse CONNECT line; defaulting upstream to 127.0.0.1:443")
+        else:
+            # Assume raw TLS
+            self.logger.debug("No CONNECT, assuming raw TLS. Attempting to parse SNI from ClientHello.")
             try:
-                self.upstream_ip = socket.gethostbyname(self.upstream_sni)
-                self.upstream_port = 443 
-                self.logger.debug(f"Resolved SNI {self.upstream_sni} to {self.upstream_ip}")
-            except socket.gaierror:
-                self.logger.error(f"Could not resolve SNI {self.upstream_sni}, defaulting to 127.0.0.1:443")
+                self.upstream_sni = certmitm.util.SNIFromHello(peek_data)
+            except (TimeoutError, ConnectionResetError) as e:
+                self.logger.debug(f"Error while peeking TLS hello: {e}")
+                self.upstream_sni = None
+
+            if self.upstream_sni:
+                self.logger.debug(f"SNI found: {self.upstream_sni}, resolving DNS...")
+                try:
+                    self.upstream_ip = socket.gethostbyname(self.upstream_sni)
+                    self.upstream_port = 443
+                    self.logger.debug(f"Resolved SNI {self.upstream_sni} to {self.upstream_ip}")
+                except socket.gaierror:
+                    self.logger.error(f"Could not resolve SNI {self.upstream_sni}, defaulting to 127.0.0.1:443")
+                    self.upstream_ip = "127.0.0.1"
+                    self.upstream_port = 443
+            else:
+                # no SNI present, fail to default
+                self.logger.debug("No SNI found, defaulting to 127.0.0.1:443")
                 self.upstream_ip = "127.0.0.1"
                 self.upstream_port = 443
-        else:
-            # no SNI present, fail to default
-            self.upstream_ip = "127.0.0.1"
-            self.upstream_port = 443
-            self.upstream_sni = None
+                self.upstream_sni = None
 
         self.upstream_name = self.upstream_sni if self.upstream_sni else self.upstream_ip
         self.upstream_str = f"{self.upstream_ip}:{self.upstream_port}:{self.upstream_sni}"
-        # -- fauxthN: modifications end --
 
         self.identifier = str([self.client_ip, self.upstream_name, self.upstream_port])
 
     def to_str(self):
-        return f"ID: {self.id}, Client: {self.client_ip}:{self.client_port}, Upstream: {self.upstream_ip}:{self.upstream_port} '{self.upstream_sni}', Identifier: {self.identifier}"
+        return (f"ID: {self.id}, Client: {self.client_ip}:{self.client_port}, "
+                f"Upstream: {self.upstream_ip}:{self.upstream_port} "
+                f"'{self.upstream_sni}', Identifier: {self.identifier}")
 
 class connection_tests(object):
 
@@ -94,10 +183,11 @@ class connection_tests(object):
         if connection.identifier not in self.all_test_dict.keys():
             with self.lock:
                 if connection.identifier not in self.all_test_dict.keys():
-                    # Create a dict to store tests for the connection identifier 
-                    self.all_test_dict[connection.identifier] = certmitm.connection.test_list(connection, self.logger, self.working_dir, self.retrytests, self.skiptests)
-                    self.logger.debug(f"Created a test dict: '{self.all_test_dict[connection.identifier].to_str()}'")
-
+                    # Create a dict to store tests for the connection identifier
+                    self.all_test_dict[connection.identifier] = certmitm.connection.test_list(
+                        connection, self.logger, self.working_dir, self.retrytests, self.skiptests)
+                    self.logger.debug(
+                        f"Created a test dict: '{self.all_test_dict[connection.identifier].to_str()}'")
 
         # Get next test based on the connection identifier
         next_test = self.all_test_dict[connection.identifier].get_test()
@@ -109,7 +199,8 @@ class connection_tests(object):
 
     def add_successfull_test(self, connection, test):
         self.all_test_dict[connection.identifier].add_successfull_test(test)
-        self.logger.debug(f"Succesfull test list now: {self.all_test_dict[connection.identifier].successfull_test_list}")
+        self.logger.debug(
+            f"Succesfull test list now: {self.all_test_dict[connection.identifier].successfull_test_list}")
 
 class test_list(object):
 
@@ -140,45 +231,51 @@ class test_list(object):
 
     def get_test(self):
         # If the tests have not yet been generated
-        if self.test_list == None:
+        if self.test_list is None:
             with self.lock:
-                if not self.test_list:
+                if self.test_list is None:
                     # Get upstream fullchain from the server
                     self.logger.debug(f"New connection to {self.connection.upstream_str}")
-                    self.upstream_cert_fullchain = certmitm.util.get_server_cert_fullchain(self.connection.upstream_ip, self.connection.upstream_port, self.connection.upstream_sni)
+                    self.upstream_cert_fullchain = certmitm.util.get_server_cert_fullchain(
+                        self.connection.upstream_ip, self.connection.upstream_port, self.connection.upstream_sni)
                     self.logger.debug(f"{self.connection.upstream_str} fullchain: '{self.upstream_cert_fullchain}'")
                     # Initialize test list
                     self.test_list = []
-                    # Generate list of tests for the 
-                    for test in certmitm.certtest.generate_test_context(self.upstream_cert_fullchain, self.connection.upstream_sni or self.connection.upstream_ip, self.working_dir, self.logger):
+                    # Generate list of tests
+                    for test in certmitm.certtest.generate_test_context(
+                        self.upstream_cert_fullchain,
+                        self.connection.upstream_sni or self.connection.upstream_ip,
+                        self.working_dir,
+                        self.logger
+                    ):
                         for i in range(int(self.retrytests)):
                             self.test_list.append(test)
                     self.logger.debug(f"Generated tests: '{self.test_list}' to {self.connection.upstream_str}")
 
-        # Pop next test if were are not skipping tests
+        # Pop next test if we are not skipping tests
         if not (self.successfull_test_list != [] and self.skiptests):
             if self.test_list:
                 with self.lock:
                     if self.test_list != []:
                         return self.test_list.pop(0)
 
-        # Get first successfull test
+        # If we already have a successfull test, use that for MITM
         if self.successfull_test_list != []:
             test = self.successfull_test_list[0]
             test.mitm = True
             return test
 
-        # tests ran out an no successfull ones found
+        # Tests ran out and no successfull ones found
         return None
 
     def add_successfull_test(self, test):
         self.successfull_test_list.append(test)
 
-        # Copy successfull test certs to mitmcerts
+        # Copy successful test certs to mitmcerts
         if not os.path.exists(self.certpath):
             os.makedirs(self.certpath)
-        certfilepath = os.path.join(self.certpath,f'{test.name}_cert.pem')
-        keyfilepath = os.path.join(self.certpath,f'{test.name}_key.pem')
+        certfilepath = os.path.join(self.certpath, f'{test.name}_cert.pem')
+        keyfilepath = os.path.join(self.certpath, f'{test.name}_key.pem')
         with open(test.certfile, 'rb') as certfile:
             with open(certfilepath, 'wb') as newcertfile:
                 newcertfile.write(certfile.read())
@@ -192,11 +289,27 @@ class test_list(object):
         if not os.path.exists(dirname):
             os.makedirs(dirname)
         with open(filename, 'a') as errorfile:
-            jsondata = json.dumps({"timestamp":str(time.time()),"client":self.connection.client_ip ,"destination":{"name":self.connection.upstream_name,"ip":self.connection.upstream_ip,"port":self.connection.upstream_port,"sni":self.connection.upstream_sni},"testcase":test.name,"certfile":certfilepath,"keyfile":keyfilepath,"datapath":self.mitmdatadir})
+            jsondata = json.dumps({
+                "timestamp": str(time.time()),
+                "client": self.connection.client_ip,
+                "destination": {
+                    "name": self.connection.upstream_name,
+                    "ip": self.connection.upstream_ip,
+                    "port": self.connection.upstream_port,
+                    "sni": self.connection.upstream_sni
+                },
+                "testcase": test.name,
+                "certfile": certfilepath,
+                "keyfile": keyfilepath,
+                "datapath": self.mitmdatadir
+            })
             errorfile.write(f"{jsondata}\n")
 
     def to_str(self):
-        return(f"Identifier: {self.connection.identifier}, Upstream: {self.connection.upstream_str}, Remaining tests: {self.test_list}, Successfull tests {self.successfull_test_list}")
+        return (f"Identifier: {self.connection.identifier}, "
+                f"Upstream: {self.connection.upstream_str}, "
+                f"Remaining tests: {self.test_list}, "
+                f"Successfull tests {self.successfull_test_list}")
 
 class mitm_connection(object):
 
@@ -208,28 +321,28 @@ class mitm_connection(object):
         self.downstream_tls_buf = b""
 
     def set_upstream(self, ip, port):
-        self.logger.debug(f"connecting to TCP upstream")
+        self.logger.debug("connecting to TCP upstream")
         self.upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.upstream_socket.settimeout(10)
         try:
             self.upstream_socket.connect((ip, port))
             self.upstream_tls = False
-            self.logger.debug(f"connected to TCP upstream")
+            self.logger.debug("connected to TCP upstream")
         except (ConnectionRefusedError, TimeoutError, OSError) as e:
             self.logger.debug(f"Upstream connection failed with {e}")
             self.upstream_socket = None
 
     def wrap_downstream(self, context):
-        self.logger.debug(f"Wrapping downstream with TLS")
+        self.logger.debug("Wrapping downstream with TLS")
         self.downstream_socket = context.wrap_socket(self.downstream_socket, server_side=True)
         self.downstream_socket.settimeout(10)
         self.downstream_tls = True
-        self.logger.debug(f"Wrapped downstream with TLS")
+        self.logger.debug("Wrapped downstream with TLS")
 
     def wrap_upstream(self, hostname):
-        self.logger.debug(f"Wrapping upstream with TLS")
+        self.logger.debug("Wrapping upstream with TLS")
         self.upstream_context = certmitm.util.create_client_context()
         self.upstream_socket = self.upstream_context.wrap_socket(self.upstream_socket, server_hostname=hostname)
         self.upstream_socket.settimeout(10)
         self.upstream_tls = True
-        self.logger.debug(f"Wrapped upstream with TLS")
+        self.logger.debug("Wrapped upstream with TLS")
